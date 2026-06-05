@@ -5,13 +5,14 @@ import requests
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
+from apscheduler.schedulers.background import BackgroundScheduler
+import atexit
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-# Variabili lette dentro le funzioni, mai al livello del modulo
 def cfg():
     return {
         "token":      os.environ.get("BOT_TOKEN", ""),
@@ -19,7 +20,8 @@ def cfg():
         "ricardo_id": int(os.environ.get("RICARDO_CHAT_ID", "5590933344")),
     }
 
-DATA_FILE = "/tmp/data.json"
+# Usa variabile d'ambiente per supportare Railway Volume (/data/data.json)
+DATA_FILE = os.environ.get("DATA_FILE", "/tmp/data.json")
 
 def load_db():
     try:
@@ -29,6 +31,7 @@ def load_db():
         return {"closures": [], "daily_sent": ""}
 
 def save_db(db):
+    os.makedirs(os.path.dirname(DATA_FILE), exist_ok=True)
     with open(DATA_FILE, "w") as f:
         json.dump(db, f, default=str, ensure_ascii=False, indent=2)
 
@@ -144,7 +147,6 @@ def make_excel(closures):
         c = ws.cell(row=1, column=ci, value=h)
         cs(c, bg="1F3864", bold=True, fc="FFFFFF")
     BG = {"Bologna":["DEEAF1","C5DCF0"], "Padova":["E2EFDA","C6E0B4"]}
-    EUR = '#,##0.00\\ €'
     for ri, rec in enumerate(sorted(closures, key=lambda x:(x["date"],x["location"])), 2):
         bg = BG.get(rec["location"],["FFFFFF","F2F2F2"])[ri%2]
         vals = [datetime.strptime(rec["date"],"%Y-%m-%d").date(), rec["location"],
@@ -154,7 +156,7 @@ def make_excel(closures):
             cell = ws.cell(row=ri, column=ci, value=val)
             cs(cell, bg=bg, al="right" if isinstance(val,float) else ("left" if ci in(2,9) else "center"))
             if ci==1: cell.number_format="DD/MM/YYYY"
-            elif ci in(3,4,5,6) and isinstance(val,float): cell.number_format=EUR
+            elif ci in(3,4,5,6) and isinstance(val,float): cell.number_format='#,##0.00\\ €'
     for ci, w in enumerate([12,10,13,12,13,13,14,12,40],1):
         ws.column_dimensions[get_column_letter(ci)].width = w
     ws.freeze_panes = "A2"
@@ -195,6 +197,24 @@ def send_summary(db, for_date=None):
     db["daily_sent"] = for_date
     save_db(db)
 
+# ── Cron giornaliero ─────────────────────────────────────────────────────
+def daily_job():
+    """Invio automatico riepilogo ogni giorno alle 09:00 ora italiana"""
+    log.info("⏰ Cron giornaliero avviato")
+    db = load_db()
+    yesterday = (date.today() - timedelta(days=1)).isoformat()
+    if db.get("daily_sent") == yesterday:
+        log.info("Riepilogo già inviato oggi, skip")
+        return
+    log.info(f"Invio riepilogo per {yesterday}")
+    send_summary(db)
+
+scheduler = BackgroundScheduler(timezone="Europe/Rome")
+scheduler.add_job(daily_job, "cron", hour=9, minute=0, id="daily_summary")
+scheduler.start()
+atexit.register(lambda: scheduler.shutdown(wait=False))
+log.info("✅ Scheduler avviato — riepilogo ogni giorno alle 09:00 ora italiana")
+
 # ── Routes ────────────────────────────────────────────────────────────────
 @app.route("/")
 def index():
@@ -203,16 +223,38 @@ def index():
 @app.route("/health")
 def health():
     db = load_db()
-    return jsonify(ok=True, closures=len(db.get("closures",[])))
+    next_run = None
+    job = scheduler.get_job("daily_summary")
+    if job and job.next_run_time:
+        next_run = job.next_run_time.strftime("%d/%m/%Y %H:%M %Z")
+    return jsonify(
+        ok=True,
+        closures=len(db.get("closures", [])),
+        daily_sent=db.get("daily_sent", "mai"),
+        next_cron=next_run,
+        data_file=DATA_FILE
+    )
 
-@app.route("/daily", methods=["GET","POST"])
+@app.route("/daily", methods=["GET", "POST"])
 def daily():
     db = load_db()
-    yesterday = (date.today()-timedelta(days=1)).isoformat()
+    yesterday = (date.today() - timedelta(days=1)).isoformat()
     if db.get("daily_sent") == yesterday:
         return jsonify(ok=True, msg="già inviato")
     send_summary(db)
     return jsonify(ok=True, msg=f"riepilogo inviato per {yesterday}")
+
+@app.route("/setup", methods=["GET", "POST"])
+def setup():
+    """Registra il webhook Telegram puntando a questo Railway URL"""
+    c = cfg()
+    if not c["token"]:
+        return jsonify(ok=False, error="BOT_TOKEN non impostato"), 500
+    host = request.host_url.rstrip("/")
+    webhook_url = f"{host}/webhook"
+    result = api("setWebhook", url=webhook_url, allowed_updates=["message"])
+    log.info(f"setWebhook → {result}")
+    return jsonify(ok=result.get("ok", False), webhook=webhook_url, telegram=result)
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
@@ -226,28 +268,32 @@ def webhook():
     if not msg:
         return jsonify(ok=True)
 
-    chat_id = msg.get("chat",{}).get("id")
-    text    = msg.get("text","")
+    chat_id = msg.get("chat", {}).get("id")
+    text    = msg.get("text", "")
     msg_id  = msg.get("message_id")
-    ts      = msg.get("date",0)
-    sender  = msg.get("from",{}).get("first_name","?")
+    ts      = msg.get("date", 0)
+    sender  = msg.get("from", {}).get("first_name", "?")
 
     # Comandi da Ricardo in privato
     if chat_id == c["ricardo_id"]:
         cmd = text.strip().split()[0] if text.strip() else ""
         if cmd == "/excel":
             if db["closures"]:
-                send_file(c["ricardo_id"],"chiusure_cassa.xlsx",
-                          make_excel(db["closures"]),"📎 Tutte le chiusure")
+                send_file(c["ricardo_id"], "chiusure_cassa.xlsx",
+                          make_excel(db["closures"]), "📎 Tutte le chiusure")
             else:
-                send(c["ricardo_id"],"Nessuna chiusura registrata.")
-        elif cmd in ("/oggi","/ieri","/summary"):
-            td = date.today().isoformat() if cmd=="/oggi" else None
+                send(c["ricardo_id"], "Nessuna chiusura registrata.")
+        elif cmd in ("/oggi", "/ieri", "/summary"):
+            td = date.today().isoformat() if cmd == "/oggi" else None
             send_summary(db, td)
         elif cmd == "/stato":
             n = len(db["closures"])
             last = db["closures"][-1]["date"] if db["closures"] else "—"
-            send(c["ricardo_id"],f"✅ Bot attivo\n📦 {n} chiusure\n📅 Ultima: {last}")
+            job = scheduler.get_job("daily_summary")
+            next_run = job.next_run_time.strftime("%d/%m %H:%M") if job and job.next_run_time else "—"
+            send(c["ricardo_id"],
+                 f"✅ Bot attivo su Railway\n📦 {n} chiusure\n"
+                 f"📅 Ultima: {last}\n⏰ Prossimo riepilogo: {next_run}")
         return jsonify(ok=True)
 
     # Messaggi dal gruppo
@@ -257,7 +303,7 @@ def webhook():
     if is_correction(text):
         send(c["ricardo_id"],
              f"⚠️ <b>Correzione ricevuta</b>\n\nDa: <b>{sender}</b>\n"
-             f"Testo:\n<pre>{text}</pre>\n\nVerifica e aggiorna l'Excel.")
+             f"Testo:\n<pre>{text}</pre>\n\nVerifica e aggiorna.")
         return jsonify(ok=True)
 
     location = detect_location(text)
@@ -267,11 +313,11 @@ def webhook():
 
     eff_d = eff_date(ts).isoformat()
     existing = next((r for r in db["closures"]
-                     if r["date"]==eff_d and r["location"]==location), None)
+                     if r["date"] == eff_d and r["location"] == location), None)
     if existing:
-        existing.update({**cash,"sender":sender})
+        existing.update({**cash, "sender": sender})
     else:
-        db["closures"].append({"date":eff_d,"location":location,"sender":sender,**cash})
+        db["closures"].append({"date": eff_d, "location": location, "sender": sender, **cash})
     save_db(db)
     delete_msg(c["group_id"], msg_id)
 
