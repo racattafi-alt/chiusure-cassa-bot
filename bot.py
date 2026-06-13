@@ -5,14 +5,15 @@ import requests
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
-from apscheduler.schedulers.background import BackgroundScheduler
-import atexit
+from openpyxl.chart import LineChart, BarChart, Reference
+from openpyxl.chart.series import SeriesLabel
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
+# Variabili lette dentro le funzioni, mai al livello del modulo
 def cfg():
     return {
         "token":      os.environ.get("BOT_TOKEN", ""),
@@ -20,8 +21,7 @@ def cfg():
         "ricardo_id": int(os.environ.get("RICARDO_CHAT_ID", "5590933344")),
     }
 
-# Usa variabile d'ambiente per supportare Railway Volume (/data/data.json)
-DATA_FILE = os.environ.get("DATA_FILE", "/tmp/data.json")
+DATA_FILE = "/tmp/data.json"
 
 def load_db():
     try:
@@ -31,7 +31,6 @@ def load_db():
         return {"closures": [], "daily_sent": ""}
 
 def save_db(db):
-    os.makedirs(os.path.dirname(DATA_FILE), exist_ok=True)
     with open(DATA_FILE, "w") as f:
         json.dump(db, f, default=str, ensure_ascii=False, indent=2)
 
@@ -133,33 +132,278 @@ def fmt(v):
     return f"{v:,.2f}".replace(",","X").replace(".",",").replace("X",".") + " €"
 
 # ── Excel ─────────────────────────────────────────────────────────────────
-def make_excel(closures):
-    wb = Workbook(); ws = wb.active; ws.title = "Chiusure"
+def _style_cell(c, bg=None, bold=False, fc="000000", sz=10, al="center", wrap=False):
     thin = Side(style="thin", color="BFBFBF")
-    def bdr(): return Border(left=thin,right=thin,top=thin,bottom=thin)
-    def cs(c, bg=None, bold=False, fc="000000", sz=10, al="center"):
-        c.font = Font(name="Arial", bold=bold, color=fc, size=sz)
-        c.alignment = Alignment(horizontal=al, vertical="center")
-        if bg: c.fill = PatternFill("solid", start_color=bg)
-        c.border = bdr()
+    c.font      = Font(name="Arial", bold=bold, color=fc, size=sz)
+    c.alignment = Alignment(horizontal=al, vertical="center", wrap_text=wrap)
+    if bg: c.fill = PatternFill("solid", start_color=bg)
+    c.border    = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+def _make_chiusure_sheet(ws, closures):
     hdrs = ["Data","Sede","Totale","B","F1","F2","Coperti Pranzo","Coperti Sera","Deduzioni"]
     for ci, h in enumerate(hdrs, 1):
-        c = ws.cell(row=1, column=ci, value=h)
-        cs(c, bg="1F3864", bold=True, fc="FFFFFF")
-    BG = {"Bologna":["DEEAF1","C5DCF0"], "Padova":["E2EFDA","C6E0B4"]}
+        _style_cell(ws.cell(row=1, column=ci, value=h), bg="1F3864", bold=True, fc="FFFFFF")
+    BG  = {"Bologna":["DEEAF1","C5DCF0"], "Padova":["E2EFDA","C6E0B4"]}
+    EUR = '#,##0.00\\ €'
     for ri, rec in enumerate(sorted(closures, key=lambda x:(x["date"],x["location"])), 2):
-        bg = BG.get(rec["location"],["FFFFFF","F2F2F2"])[ri%2]
+        bg   = BG.get(rec["location"],["FFFFFF","F2F2F2"])[ri%2]
         vals = [datetime.strptime(rec["date"],"%Y-%m-%d").date(), rec["location"],
                 rec.get("tot"), rec.get("b"), rec.get("f1"), rec.get("f2"),
                 None, None, rec.get("deductions","")]
         for ci, val in enumerate(vals, 1):
             cell = ws.cell(row=ri, column=ci, value=val)
-            cs(cell, bg=bg, al="right" if isinstance(val,float) else ("left" if ci in(2,9) else "center"))
+            _style_cell(cell, bg=bg,
+                        al="right" if isinstance(val,float) else ("left" if ci in(2,9) else "center"),
+                        wrap=(ci==9))
             if ci==1: cell.number_format="DD/MM/YYYY"
-            elif ci in(3,4,5,6) and isinstance(val,float): cell.number_format='#,##0.00\\ €'
+            elif ci in(3,4,5,6) and isinstance(val,float): cell.number_format=EUR
     for ci, w in enumerate([12,10,13,12,13,13,14,12,40],1):
         ws.column_dimensions[get_column_letter(ci)].width = w
     ws.freeze_panes = "A2"
+
+def _make_stats_sheet(ws2, closures):
+    from collections import defaultdict
+    EUR = '#,##0.00\\ €'
+    cs  = _style_cell
+
+    bol_recs = sorted([r for r in closures if r["location"]=="Bologna"], key=lambda x:x["date"])
+    pad_recs = sorted([r for r in closures if r["location"]=="Padova"],  key=lambda x:x["date"])
+
+    def avg(lst):  return sum(lst)/len(lst) if lst else None
+    def smax(lst): return max(lst) if lst else None
+    def smin(lst): return min(lst) if lst else None
+    def ssum(lst): return sum(lst) if lst else None
+
+    bol_tots = [r["tot"] for r in bol_recs if r.get("tot")]
+    pad_tots = [r["tot"] for r in pad_recs if r.get("tot")]
+    bol_f1s  = [r["f1"]  for r in bol_recs if r.get("f1")]
+    pad_f1s  = [r["f1"]  for r in pad_recs if r.get("f1")]
+    bol_bs   = [r["b"]   for r in bol_recs if r.get("b")]
+    pad_bs   = [r["b"]   for r in pad_recs if r.get("b")]
+
+    # ── Cumulativo mese corrente ─────────────────────────────────────────────
+    cur_month = date.today().strftime("%Y-%m")
+    cur_name  = date.today().strftime("%B %Y")
+    cur_bol   = ssum([r.get("tot",0) or 0 for r in bol_recs if r["date"].startswith(cur_month)]) or 0
+    cur_pad   = ssum([r.get("tot",0) or 0 for r in pad_recs if r["date"].startswith(cur_month)]) or 0
+
+    # ── Titolo ──────────────────────────────────────────────────────────────
+    ws2.merge_cells("A1:C1")
+    t = ws2["A1"]
+    t.value     = "Statistiche Chiusure Cassa"
+    t.font      = Font(name="Arial", bold=True, size=14, color="1F3864")
+    t.alignment = Alignment(horizontal="center", vertical="center")
+    ws2.row_dimensions[1].height = 28
+
+    # ── Tabella statistiche generali (righe 3-10) ────────────────────────────
+    for ci, (h, bg) in enumerate([("Statistica","1F3864"),
+                                   ("Bologna",   "2E75B6"),
+                                   ("Padova",    "548235")], 1):
+        cs(ws2.cell(row=3, column=ci, value=h), bg=bg, bold=True, fc="FFFFFF")
+
+    stats = [
+        ("Giornate registrate", len(bol_recs),     len(pad_recs),     False),
+        ("Totale medio",        avg(bol_tots),      avg(pad_tots),     True),
+        ("Totale massimo",      smax(bol_tots),     smax(pad_tots),    True),
+        ("Totale minimo",       smin(bol_tots),     smin(pad_tots),    True),
+        ("Somma periodo",       ssum(bol_tots),     ssum(pad_tots),    True),
+        ("F1 medio",            avg(bol_f1s),       avg(pad_f1s),      True),
+        ("B medio",             avg(bol_bs),        avg(pad_bs),       True),
+    ]
+    for ri, (lbl, bv, pv, is_eur) in enumerate(stats, 4):
+        row_bg = "F2F2F2" if ri%2==0 else "FFFFFF"
+        cs(ws2.cell(row=ri, column=1, value=lbl), bg=row_bg, al="left")
+        for ci, (val, bg2) in enumerate([(bv,"DEEAF1"),(pv,"E2EFDA")], 2):
+            cell = ws2.cell(row=ri, column=ci, value=val)
+            cs(cell, bg=bg2, al="right" if is_eur else "center")
+            if is_eur and isinstance(val, float):
+                cell.number_format = EUR
+
+    # ── Mini-tabella mese corrente (righe 12-14) ─────────────────────────────
+    ws2.merge_cells("A12:C12")
+    h12 = ws2["A12"]
+    h12.value     = f"Mese corrente: {cur_name}"
+    h12.font      = Font(name="Arial", bold=True, size=11, color="1F3864")
+    h12.alignment = Alignment(horizontal="center", vertical="center")
+    ws2.row_dimensions[12].height = 22
+
+    for ci, (h, bg) in enumerate([("","1F3864"),("Bologna","2E75B6"),("Padova","548235")], 1):
+        cs(ws2.cell(row=13, column=ci, value=h), bg=bg, bold=True, fc="FFFFFF")
+
+    cs(ws2.cell(row=14, column=1, value="Cumulativo ad oggi"), bg="F2F2F2", al="left")
+    for ci, (val, bg2) in enumerate([(cur_bol or None,"DEEAF1"),(cur_pad or None,"E2EFDA")], 2):
+        cell = ws2.cell(row=14, column=ci, value=val)
+        cs(cell, bg=bg2, al="right")
+        if val: cell.number_format = EUR
+
+    ws2.column_dimensions["A"].width = 22
+    ws2.column_dimensions["B"].width = 16
+    ws2.column_dimensions["C"].width = 16
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Dati nascosti per i grafici (dal col E in poi)
+    # ══════════════════════════════════════════════════════════════════════════
+    all_dates = sorted(set(r["date"] for r in closures))
+    bol_by_d  = {r["date"]: r for r in bol_recs}
+    pad_by_d  = {r["date"]: r for r in pad_recs}
+    n = len(all_dates)
+
+    def hidden_hdr(col, text):
+        ws2.cell(row=3, column=col, value=text).font = Font(color="FFFFFF", size=7)
+        ws2.column_dimensions[get_column_letter(col)].width = 11
+
+    # ── Dati giornalieri: col E(5)-I(9) ─────────────────────────────────────
+    DC = 5  # daily col start
+    for ci, h in enumerate(["Data","Bol Tot","Pad Tot","Bol F1","Pad F1"], DC):
+        hidden_hdr(ci, h)
+    for i, d in enumerate(all_dates):
+        row = 4 + i
+        dt  = datetime.strptime(d, "%Y-%m-%d").date()
+        c   = ws2.cell(row=row, column=DC, value=dt); c.number_format = "DD/MM"
+        br  = bol_by_d.get(d); pr = pad_by_d.get(d)
+        ws2.cell(row=row, column=DC+1, value=br.get("tot") if br else None)
+        ws2.cell(row=row, column=DC+2, value=pr.get("tot") if pr else None)
+        ws2.cell(row=row, column=DC+3, value=br.get("f1")  if br else None)
+        ws2.cell(row=row, column=DC+4, value=pr.get("f1")  if pr else None)
+
+    # ── Dati mensili: col K(11)-M(13) ────────────────────────────────────────
+    MC = 11
+    monthly_bol = defaultdict(float); monthly_pad = defaultdict(float)
+    for r in closures:
+        m = r["date"][:7]
+        if r["location"]=="Bologna": monthly_bol[m] += r.get("tot",0) or 0
+        else:                        monthly_pad[m] += r.get("tot",0) or 0
+    all_months = sorted(set(list(monthly_bol)+list(monthly_pad)))
+    for ci, h in enumerate(["Mese","Bologna","Padova"], MC):
+        hidden_hdr(ci, h)
+    for i, m in enumerate(all_months):
+        row = 4 + i
+        dt  = datetime.strptime(m+"-01", "%Y-%m-%d")
+        ws2.cell(row=row, column=MC,   value=dt.strftime("%b %Y"))
+        ws2.cell(row=row, column=MC+1, value=monthly_bol[m] or None)
+        ws2.cell(row=row, column=MC+2, value=monthly_pad[m] or None)
+    nm = len(all_months)
+
+    # ── Dati settimanali: col O(15)-Q(17) ────────────────────────────────────
+    WC = 15
+    weekly_bol = defaultdict(float); weekly_pad = defaultdict(float)
+    for r in closures:
+        dt = datetime.strptime(r["date"], "%Y-%m-%d")
+        wk = dt.strftime("Sett %V/%y")
+        if r["location"]=="Bologna": weekly_bol[wk] += r.get("tot",0) or 0
+        else:                        weekly_pad[wk] += r.get("tot",0) or 0
+    all_weeks = sorted(set(list(weekly_bol)+list(weekly_pad)))
+    for ci, h in enumerate(["Settimana","Bologna","Padova"], WC):
+        hidden_hdr(ci, h)
+    for i, wk in enumerate(all_weeks):
+        row = 4 + i
+        ws2.cell(row=row, column=WC,   value=wk)
+        ws2.cell(row=row, column=WC+1, value=weekly_bol[wk] or None)
+        ws2.cell(row=row, column=WC+2, value=weekly_pad[wk] or None)
+    nw = len(all_weeks)
+
+    # ── Dati cumulativi mese corrente: col S(19)-V(22) ────────────────────────
+    SC = 19
+    cur_dates = sorted(d for d in all_dates if d.startswith(cur_month))
+    for ci, h in enumerate(["Data","Bol Cum","Pad Cum","Tot Cum"], SC):
+        hidden_hdr(ci, h)
+    bcum = pcum = 0.0
+    for i, d in enumerate(cur_dates):
+        row = 4 + i
+        dt  = datetime.strptime(d, "%Y-%m-%d").date()
+        c   = ws2.cell(row=row, column=SC, value=dt); c.number_format = "DD/MM"
+        br  = bol_by_d.get(d); pr = pad_by_d.get(d)
+        bcum += (br.get("tot",0) or 0) if br else 0
+        pcum += (pr.get("tot",0) or 0) if pr else 0
+        ws2.cell(row=row, column=SC+1, value=bcum or None)
+        ws2.cell(row=row, column=SC+2, value=pcum or None)
+        ws2.cell(row=row, column=SC+3, value=(bcum+pcum) or None)
+    ns = len(cur_dates)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Grafici
+    # ══════════════════════════════════════════════════════════════════════════
+    def line_chart(title, y_title="€", w=26, h=14):
+        c = LineChart(); c.title=title; c.style=10
+        c.y_axis.title=y_title; c.x_axis.title="Data"
+        c.width=w; c.height=h; c.legend.position="b"
+        return c
+
+    def bar_chart(title, y_title="€", w=26, h=14):
+        c = BarChart(); c.type="col"; c.title=title; c.style=10
+        c.y_axis.title=y_title; c.x_axis.title=""
+        c.width=w; c.height=h; c.legend.position="b"
+        return c
+
+    def try_line_colors(chart, colors):
+        try:
+            for i, col in enumerate(colors):
+                chart.series[i].graphicalProperties.line.solidFill = col
+                chart.series[i].graphicalProperties.line.width      = 22000
+                chart.series[i].marker.symbol = "circle"
+                chart.series[i].marker.size   = 4
+        except Exception: pass
+
+    def try_bar_colors(chart, colors):
+        try:
+            for i, col in enumerate(colors):
+                chart.series[i].graphicalProperties.solidFill = col
+        except Exception: pass
+
+    # Grafico 1 – Andamento Totale giornaliero
+    if n >= 1:
+        ch1 = line_chart("Andamento Totale Giornaliero")
+        dr  = Reference(ws2, min_col=DC,   min_row=4, max_row=3+n)
+        for col_i in [DC+1, DC+2]:
+            ch1.add_data(Reference(ws2, min_col=col_i, min_row=3, max_row=3+n), titles_from_data=True)
+        ch1.set_categories(Reference(ws2, min_col=DC, min_row=4, max_row=3+n))
+        try_line_colors(ch1, ["2E75B6","70AD47"])
+        ws2.add_chart(ch1, "A17")
+
+    # Grafico 2 – Andamento F1
+    if n >= 1:
+        ch2 = line_chart("Andamento Fondo Cassa (F1)")
+        for col_i in [DC+3, DC+4]:
+            ch2.add_data(Reference(ws2, min_col=col_i, min_row=3, max_row=3+n), titles_from_data=True)
+        ch2.set_categories(Reference(ws2, min_col=DC, min_row=4, max_row=3+n))
+        try_line_colors(ch2, ["2E75B6","70AD47"])
+        ws2.add_chart(ch2, "A37")
+
+    # Grafico 3 – Fatturato Mensile (barre)
+    if nm >= 1:
+        ch3 = bar_chart("Fatturato Mensile")
+        for col_i in [MC+1, MC+2]:
+            ch3.add_data(Reference(ws2, min_col=col_i, min_row=3, max_row=3+nm), titles_from_data=True)
+        ch3.set_categories(Reference(ws2, min_col=MC, min_row=4, max_row=3+nm))
+        try_bar_colors(ch3, ["2E75B6","70AD47"])
+        ws2.add_chart(ch3, "A57")
+
+    # Grafico 4 – Fatturato Settimanale (barre)
+    if nw >= 1:
+        ch4 = bar_chart("Fatturato Settimanale")
+        for col_i in [WC+1, WC+2]:
+            ch4.add_data(Reference(ws2, min_col=col_i, min_row=3, max_row=3+nw), titles_from_data=True)
+        ch4.set_categories(Reference(ws2, min_col=WC, min_row=4, max_row=3+nw))
+        try_bar_colors(ch4, ["2E75B6","70AD47"])
+        ws2.add_chart(ch4, "A77")
+
+    # Grafico 5 – Cumulativo mese corrente (linea)
+    if ns >= 1:
+        ch5 = line_chart(f"Cumulativo Mese Corrente ({cur_name})")
+        for col_i in [SC+1, SC+2, SC+3]:
+            ch5.add_data(Reference(ws2, min_col=col_i, min_row=3, max_row=3+ns), titles_from_data=True)
+        ch5.set_categories(Reference(ws2, min_col=SC, min_row=4, max_row=3+ns))
+        try_line_colors(ch5, ["2E75B6","70AD47","D4700F"])
+        ws2.add_chart(ch5, "A97")
+
+def make_excel(closures):
+    wb = Workbook()
+    ws  = wb.active; ws.title = "Chiusure"
+    _make_chiusure_sheet(ws, closures)
+
+    ws2 = wb.create_sheet("Statistiche")
+    _make_stats_sheet(ws2, closures)
+
     buf = io.BytesIO(); wb.save(buf); buf.seek(0)
     return buf.read()
 
@@ -197,24 +441,6 @@ def send_summary(db, for_date=None):
     db["daily_sent"] = for_date
     save_db(db)
 
-# ── Cron giornaliero ─────────────────────────────────────────────────────
-def daily_job():
-    """Invio automatico riepilogo ogni giorno alle 09:00 ora italiana"""
-    log.info("⏰ Cron giornaliero avviato")
-    db = load_db()
-    yesterday = (date.today() - timedelta(days=1)).isoformat()
-    if db.get("daily_sent") == yesterday:
-        log.info("Riepilogo già inviato oggi, skip")
-        return
-    log.info(f"Invio riepilogo per {yesterday}")
-    send_summary(db)
-
-scheduler = BackgroundScheduler(timezone="Europe/Rome")
-scheduler.add_job(daily_job, "cron", hour=9, minute=0, id="daily_summary")
-scheduler.start()
-atexit.register(lambda: scheduler.shutdown(wait=False))
-log.info("✅ Scheduler avviato — riepilogo ogni giorno alle 09:00 ora italiana")
-
 # ── Routes ────────────────────────────────────────────────────────────────
 @app.route("/")
 def index():
@@ -223,38 +449,16 @@ def index():
 @app.route("/health")
 def health():
     db = load_db()
-    next_run = None
-    job = scheduler.get_job("daily_summary")
-    if job and job.next_run_time:
-        next_run = job.next_run_time.strftime("%d/%m/%Y %H:%M %Z")
-    return jsonify(
-        ok=True,
-        closures=len(db.get("closures", [])),
-        daily_sent=db.get("daily_sent", "mai"),
-        next_cron=next_run,
-        data_file=DATA_FILE
-    )
+    return jsonify(ok=True, closures=len(db.get("closures",[])))
 
-@app.route("/daily", methods=["GET", "POST"])
+@app.route("/daily", methods=["GET","POST"])
 def daily():
     db = load_db()
-    yesterday = (date.today() - timedelta(days=1)).isoformat()
+    yesterday = (date.today()-timedelta(days=1)).isoformat()
     if db.get("daily_sent") == yesterday:
         return jsonify(ok=True, msg="già inviato")
     send_summary(db)
     return jsonify(ok=True, msg=f"riepilogo inviato per {yesterday}")
-
-@app.route("/setup", methods=["GET", "POST"])
-def setup():
-    """Registra il webhook Telegram puntando a questo Railway URL"""
-    c = cfg()
-    if not c["token"]:
-        return jsonify(ok=False, error="BOT_TOKEN non impostato"), 500
-    host = request.host_url.rstrip("/")
-    webhook_url = f"{host}/webhook"
-    result = api("setWebhook", url=webhook_url, allowed_updates=["message"])
-    log.info(f"setWebhook → {result}")
-    return jsonify(ok=result.get("ok", False), webhook=webhook_url, telegram=result)
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
@@ -268,32 +472,28 @@ def webhook():
     if not msg:
         return jsonify(ok=True)
 
-    chat_id = msg.get("chat", {}).get("id")
-    text    = msg.get("text", "")
+    chat_id = msg.get("chat",{}).get("id")
+    text    = msg.get("text","")
     msg_id  = msg.get("message_id")
-    ts      = msg.get("date", 0)
-    sender  = msg.get("from", {}).get("first_name", "?")
+    ts      = msg.get("date",0)
+    sender  = msg.get("from",{}).get("first_name","?")
 
     # Comandi da Ricardo in privato
     if chat_id == c["ricardo_id"]:
         cmd = text.strip().split()[0] if text.strip() else ""
         if cmd == "/excel":
             if db["closures"]:
-                send_file(c["ricardo_id"], "chiusure_cassa.xlsx",
-                          make_excel(db["closures"]), "📎 Tutte le chiusure")
+                send_file(c["ricardo_id"],"chiusure_cassa.xlsx",
+                          make_excel(db["closures"]),"📎 Tutte le chiusure")
             else:
-                send(c["ricardo_id"], "Nessuna chiusura registrata.")
-        elif cmd in ("/oggi", "/ieri", "/summary"):
-            td = date.today().isoformat() if cmd == "/oggi" else None
+                send(c["ricardo_id"],"Nessuna chiusura registrata.")
+        elif cmd in ("/oggi","/ieri","/summary"):
+            td = date.today().isoformat() if cmd=="/oggi" else None
             send_summary(db, td)
         elif cmd == "/stato":
             n = len(db["closures"])
             last = db["closures"][-1]["date"] if db["closures"] else "—"
-            job = scheduler.get_job("daily_summary")
-            next_run = job.next_run_time.strftime("%d/%m %H:%M") if job and job.next_run_time else "—"
-            send(c["ricardo_id"],
-                 f"✅ Bot attivo su Railway\n📦 {n} chiusure\n"
-                 f"📅 Ultima: {last}\n⏰ Prossimo riepilogo: {next_run}")
+            send(c["ricardo_id"],f"✅ Bot attivo\n📦 {n} chiusure\n📅 Ultima: {last}")
         return jsonify(ok=True)
 
     # Messaggi dal gruppo
@@ -303,7 +503,7 @@ def webhook():
     if is_correction(text):
         send(c["ricardo_id"],
              f"⚠️ <b>Correzione ricevuta</b>\n\nDa: <b>{sender}</b>\n"
-             f"Testo:\n<pre>{text}</pre>\n\nVerifica e aggiorna.")
+             f"Testo:\n<pre>{text}</pre>\n\nVerifica e aggiorna l'Excel.")
         return jsonify(ok=True)
 
     location = detect_location(text)
@@ -313,11 +513,11 @@ def webhook():
 
     eff_d = eff_date(ts).isoformat()
     existing = next((r for r in db["closures"]
-                     if r["date"] == eff_d and r["location"] == location), None)
+                     if r["date"]==eff_d and r["location"]==location), None)
     if existing:
-        existing.update({**cash, "sender": sender})
+        existing.update({**cash,"sender":sender})
     else:
-        db["closures"].append({"date": eff_d, "location": location, "sender": sender, **cash})
+        db["closures"].append({"date":eff_d,"location":location,"sender":sender,**cash})
     save_db(db)
     delete_msg(c["group_id"], msg_id)
 
